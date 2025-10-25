@@ -1,7 +1,7 @@
 import json
 
-input_path = "/mnt/localssd/shivank/agents/agents-image-gen/eval_benchmark/DrawBench_seed.txt"
-output_path = "/mnt/localssd/shivank/agents/agents-image-gen/eval_benchmark/DrawBench_seed.json"
+input_path = ""
+output_path = ""
 
 result = {}
 with open(input_path, "r", encoding="utf-8") as f:

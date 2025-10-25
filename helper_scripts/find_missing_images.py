@@ -1,9 +1,9 @@
 import os
 import csv
 
-csv_path = "eval_benchmark/OneIG-Bench.csv"
-img_dir = "OneIG-ep1-best-images"
-output_csv = "missing_images_ep1_oneig.csv"
+csv_path = ""
+img_dir = ""
+output_csv = ""
 
 # 1. Collect expected image filenames from CSV
 expected = []

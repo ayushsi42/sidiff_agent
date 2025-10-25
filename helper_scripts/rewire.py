@@ -1,8 +1,8 @@
 import os
 import shutil
 
-src_dir = "OneIG-ep2-best-images"
-dst_dir = "OneIG-ep2-best-images-rewired"
+src_dir = ""
+dst_dir = ""
 
 for filename in os.listdir(src_dir):
     if not filename.endswith(".webp"):

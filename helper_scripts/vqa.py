@@ -19,12 +19,11 @@ def evaluate_dataset():
     clip_flant5_score = t2v_metrics.VQAScore(model='clip-flant5-xxl')
     
     # Load prompts from TXT file
-    txt_path = '/mnt/home2/home/pranav_s/agents-image-gen/eval_benchmark/DrawBench_seed.txt'
+    txt_path = ''
     prompts_data = load_prompts_from_txt(txt_path)
     
     # Define the image folder path
-    image_folder = "/mnt/home2/home/pranav_s/agents-image-gen/final_images_drawbench_ep2"
-    # image_folder = "/mnt/home2/home/pranav_s/agents-image-gen/results_drawbench_memory_genai/DrawBench-fixseed_memory_ep1/AgentSys_vRelease/final_memory_images"
+    image_folder = ""
     
     # Get all image files in the folder
     image_files = glob.glob(os.path.join(image_folder, "*.png"))

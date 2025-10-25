@@ -3,8 +3,8 @@ import json
 import shutil
 import re
 
-base_dir = '/mnt/home2/home/pranav_s/agents-image-gen/our_agent_oneig/results_ep1_kr/results_oneig_knowledge_reason_ep1/OneIG-Bench/vRelease'
-final_dir = '/mnt/home2/home/pranav_s/agents-image-gen/OneIG-ep1-knowledge-best-images'
+base_dir = ''
+final_dir = ''
 os.makedirs(final_dir, exist_ok=True)
 
 def resolve_path(img_path):
@@ -12,7 +12,7 @@ def resolve_path(img_path):
     if os.path.isabs(img_path) and os.path.isfile(img_path):
         return img_path
     # If starts with 'results/OneIG-Bench/vRelease/', strip and join with base_dir
-    prefix = 'results/OneIG-Bench/vRelease/'
+    prefix = ''
     if img_path.startswith(prefix):
         rel_path = img_path[len(prefix):]
         candidate = os.path.join(base_dir, rel_path)
