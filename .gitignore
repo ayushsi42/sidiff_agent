@@ -1,0 +1,8 @@
+conda*
+.env
+results/
+__pycache__/
+*.db
+demo_*
+test_*
+logs/
