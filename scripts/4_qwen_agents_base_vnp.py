@@ -1864,7 +1864,7 @@ def track_llm_call(llm_func, llm_type, *args, **kwargs):
     llm_token_counts[llm_type].append((prompt_tokens, completion_tokens, total_tokens))
     return response
 
-def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False, use_quantization=True):
+def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False, use_quantization=True, gpu_id=0, start_idx=0, end_idx=None):
     """Main CLI entry point."""
     # Check CUDA availability and initialize
     if not torch.cuda.is_available():
@@ -1872,12 +1872,12 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
     
     # Initialize primary CUDA device
     torch.cuda.init()
-    torch.cuda.set_device(0)
+    torch.cuda.set_device(gpu_id)
     
     # Print GPU info
-    gpu_name = torch.cuda.get_device_name(0)
-    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    print(f"\nUsing GPU: {gpu_name}")
+    gpu_name = torch.cuda.get_device_name(gpu_id)
+    gpu_memory = torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3
+    print(f"\nUsing GPU {gpu_id}: {gpu_name}")
     print(f"Available GPU memory: {gpu_memory:.2f} GB")
     print(f"Number of available GPUs: {torch.cuda.device_count()}")
     # Declare globals
@@ -1901,33 +1901,101 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
     benchmark_list.append(os.path.join("eval_benchmark/", benchmark_name))
 
     for benchmark_dir in benchmark_list:
-
-        # Read prompts from the file
-        with open(benchmark_dir, 'r') as file:
-            if "DrawBench" in str(benchmark_name):
-                if "seed" in str(benchmark_name):
-                    lines = [line.strip().split('\t') for line in file]
-                    prompts = [line[0] for line in lines]
-                    seeds = [int(line[1]) for line in lines]
-                    bench_result_folder = 'DrawBench-fixseed'
+        
+        # Check if it's a directory (like dpg_bench/prompts)
+        if os.path.isdir(benchmark_dir):
+            # Get all .txt files sorted numerically
+            txt_files = sorted([f for f in os.listdir(benchmark_dir) if f.endswith('.txt')],
+                              key=lambda x: int(os.path.splitext(x)[0]) if os.path.splitext(x)[0].isdigit() else 0)
+            
+            prompts = []
+            seeds = []
+            prompt_keys = []
+            
+            for txt_file in txt_files:
+                file_path = os.path.join(benchmark_dir, txt_file)
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    prompt = f.read().strip()
+                    if prompt:
+                        prompts.append(prompt)
+                        seeds.append(torch.randint(0, 1000000, (1,)).item())
+                        # Use filename without extension as key
+                        prompt_keys.append(os.path.splitext(txt_file)[0])
+            
+            bench_result_folder = os.path.basename(os.path.dirname(benchmark_dir)) if os.path.basename(benchmark_dir) == 'prompts' else os.path.basename(benchmark_dir)
+            
+        else:
+            # Read prompts from the file
+            with open(benchmark_dir, 'r', encoding='utf-8') as file:
+                if "DrawBench" in str(benchmark_name):
+                    if "seed" in str(benchmark_name):
+                        lines = [line.strip().split('\t') for line in file]
+                        prompts = [line[0] for line in lines]
+                        seeds = [int(line[1]) for line in lines]
+                        bench_result_folder = 'DrawBench-fixseed'
+                    else:
+                        prompts = [line.strip().split('\t')[0] for line in file]
+                        seeds = [torch.randint(0, 1000000, (1,)).item() for _ in prompts]
+                        bench_result_folder = 'DrawBench'
+                    prompt_keys = prompts
+                elif "GenAIBenchmark" in str(benchmark_name):
+                    prompts = json.load(file)
+                    prompt_keys = list(prompts.keys())
+                    seeds = []
+                    bench_result_folder = 'GenAIBenchmark-fixseed'
                 else:
-                    prompts = [line.strip().split('\t')[0] for line in file]
-                    bench_result_folder = 'DrawBench'
-                prompt_keys = prompts
-            elif "GenAIBenchmark" in str(benchmark_name):
-                prompts = json.load(file)
-                prompt_keys = list(prompts.keys())
-                bench_result_folder = 'GenAIBenchmark-fixseed'
+                    # Try to load as JSON first
+                    try:
+                        prompts = json.load(file)
+                        prompt_keys = list(prompts.keys())
+                        seeds = []
+                        bench_result_folder = "custom_benchmark"
+                    except json.JSONDecodeError:
+                        # Fall back to text format
+                        file.seek(0)
+                        content = file.read().strip()
+                        if '\t' not in content:
+                            # Single prompt file
+                            prompts = [content]
+                            seeds = [torch.randint(0, 1000000, (1,)).item()]
+                            prompt_keys = [os.path.splitext(os.path.basename(benchmark_dir))[0]]
+                        else:
+                            # Tab-separated format
+                            lines = content.split('\n')
+                            lines = [line.strip().split('\t') for line in lines if line.strip()]
+                            prompts = [line[0] for line in lines]
+                            seeds = [int(line[1]) for line in lines]
+                            prompt_keys = prompts
+                        bench_result_folder = os.path.basename(benchmark_dir)
+
+        # Apply data splitting for multi-GPU processing
+        total_prompts = len(prompt_keys)
+        if end_idx is not None:
+            # Slice the data
+            if isinstance(prompts, dict):
+                # For dictionary-based prompts (GenAI benchmark)
+                prompt_keys = prompt_keys[start_idx:end_idx]
+                prompts = {k: prompts[k] for k in prompt_keys}
             else:
-                prompts = json.load(file)
-                prompt_keys = list(prompts.keys())
-                bench_result_folder = "123"
-            # else:
-            #     lines = [line.strip().split('\t') for line in file]
-            #     prompts = [line[0] for line in lines]
-            #     seeds = [int(line[1]) for line in lines]
-            #     prompt_keys = prompts
-            #     bench_result_folder = os.path.basename(benchmark_dir)
+                # For list-based prompts
+                prompt_keys = prompt_keys[start_idx:end_idx]
+                prompts = prompts[start_idx:end_idx] if isinstance(prompts, list) else prompts
+                if isinstance(seeds, list):
+                    seeds = seeds[start_idx:end_idx]
+            print(f"\nGPU {gpu_id}: Processing slice [{start_idx}:{end_idx}] = {len(prompt_keys)} prompts out of {total_prompts} total")
+        elif start_idx > 0:
+            # Process from start_idx to end
+            if isinstance(prompts, dict):
+                prompt_keys = prompt_keys[start_idx:]
+                prompts = {k: prompts[k] for k in prompt_keys}
+            else:
+                prompt_keys = prompt_keys[start_idx:]
+                prompts = prompts[start_idx:] if isinstance(prompts, list) else prompts
+                if isinstance(seeds, list):
+                    seeds = seeds[start_idx:]
+            print(f"\nGPU {gpu_id}: Processing from index {start_idx} = {len(prompt_keys)} prompts out of {total_prompts} total")
+        else:
+            print(f"\nGPU {gpu_id}: Processing all {len(prompt_keys)} prompts")
 
         # Create model type suffix for directory
         model_suffix = model_version
@@ -1936,23 +2004,15 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
             model_name = open_llm_model.split('/')[-1]
             model_suffix += f"_open_llm_{model_name}"
         
-        # Extract part number from benchmark_name for GPU-specific directories
-        part_number = None
-        if "part_" in str(benchmark_name):
-            import re
-            match = re.search(r'part_(\d+)', str(benchmark_name))
-            if match:
-                part_number = match.group(1)
-        
         # Create GPU-specific directory structure
         base_dir_name = f"AgentSys_{model_suffix}_human_in_loop" if human_in_the_loop else f"AgentSys_{model_suffix}"
         
-        if part_number:
-            # For parallel GPU runs, create part-specific subdirectories
-            save_dir = os.path.join("results", bench_result_folder, base_dir_name, f"part_{part_number}")
+        if end_idx is not None or start_idx > 0:
+            # Multi-GPU run - create GPU-specific directory
+            save_dir = os.path.join("results", bench_result_folder, base_dir_name, f"gpu_{gpu_id}")
             print(f"Using GPU-specific results directory: {save_dir}")
         else:
-            # For single runs or complete datasets
+            # Single run
             save_dir = os.path.join("results", bench_result_folder, base_dir_name)
         
         if not os.path.exists(save_dir):
@@ -2133,7 +2193,9 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 "inference_times": inference_times,
                 "max_gpu_memories": max_gpu_memories,
                 "benchmark_name": benchmark_name,
-                "part_number": part_number if part_number else "complete"
+                "gpu_id": gpu_id,
+                "start_idx": start_idx,
+                "end_idx": end_idx if end_idx is not None else len(prompt_keys)
             }
             with open(stats_file, "w") as f:
                 json.dump(stats, f, indent=2)
@@ -2183,7 +2245,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="T2I-Copilot Agent System")
-    parser.add_argument('--benchmark_name', default='cool_sample.txt', type=str, help='Path to the benchmark directory: cool_sample.txt, GenAIBenchmark/genai_image_seed.json, ambiguous_seed.txt')
+    parser.add_argument('--benchmark_name', default='cool_sample.txt', type=str, 
+                       help='Path to the benchmark file or directory: cool_sample.txt, GenAIBenchmark/genai_image_seed.json, ambiguous_seed.txt, dpg_bench/prompts')
     parser.add_argument('--human_in_the_loop', action='store_true', help='Use human in the loop')
     parser.add_argument('--model_version', default='vRelease', type=str, help= 'Model version')
     parser.add_argument('--use_open_llm', action='store_true', help='Use open source LLM.')
@@ -2192,6 +2255,9 @@ if __name__ == "__main__":
     parser.add_argument('--open_llm_host', default='0.0.0.0', type=str, help='Host address for the open LLM server')
     parser.add_argument('--open_llm_port', default='8000', type=str, help='Port for the open LLM server')
     parser.add_argument('--calculate_latency', action='store_true', help='Calculate and print latency statistics')
+    parser.add_argument('--gpu_id', type=int, default=0, help='GPU ID to use for this process')
+    parser.add_argument('--start_idx', type=int, default=0, help='Start index for data splitting (inclusive)')
+    parser.add_argument('--end_idx', type=int, default=None, help='End index for data splitting (exclusive)')
 
     args = parser.parse_args()
-    main(args.benchmark_name, args.human_in_the_loop, args.model_version, args.use_open_llm, args.open_llm_model, args.open_llm_host, args.open_llm_port, args.calculate_latency)
+    main(args.benchmark_name, args.human_in_the_loop, args.model_version, args.use_open_llm, args.open_llm_model, args.open_llm_host, args.open_llm_port, args.calculate_latency, args.gpu_id, args.start_idx, args.end_idx)

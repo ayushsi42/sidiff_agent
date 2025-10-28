@@ -136,10 +136,28 @@ def generate_image(pipe, prompt, seed, image_index, save_dir):
         return None
 
 def load_benchmark(benchmark_path):
-    """Load benchmark prompts and seeds from file"""
+    """Load benchmark prompts and seeds from file or directory"""
     prompts = []
     seeds = []
     image_indices = []
+    
+    # Check if it's a directory (like dpg_bench/prompts)
+    if os.path.isdir(benchmark_path):
+        # Get all .txt files sorted numerically
+        txt_files = sorted([f for f in os.listdir(benchmark_path) if f.endswith('.txt')],
+                          key=lambda x: int(os.path.splitext(x)[0]) if os.path.splitext(x)[0].isdigit() else 0)
+        
+        for txt_file in txt_files:
+            file_path = os.path.join(benchmark_path, txt_file)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                prompt = f.read().strip()
+                if prompt:
+                    prompts.append(prompt)
+                    seeds.append(torch.randint(0, 1000000, (1,)).item())
+                    # Use filename without extension as index
+                    image_indices.append(os.path.splitext(txt_file)[0])
+        
+        return prompts, seeds, image_indices
     
     # Support both .txt and .json input
     if benchmark_path.endswith('.json'):
@@ -149,29 +167,37 @@ def load_benchmark(benchmark_path):
             seeds = []
             image_indices = []
             for idx, (key, entry) in enumerate(data.items()):
-                # Support both old and new formats
-                prompt = entry.get('prompt')
-                seed = entry.get('random_seed')
-                id_val = entry.get('id', f"{idx:05d}")
-                if prompt is not None and seed is not None:
-                    prompts.append(prompt)
-                    seeds.append(int(seed))
-                    image_indices.append(id_val)
+                prompts.append(entry['prompt'])
+                seeds.append(entry.get('random_seed', torch.randint(0, 1000000, (1,)).item()))
+                image_indices.append(entry.get('id', f"{idx:03d}"))
+                
         return prompts, seeds, image_indices
     else:
         with open(benchmark_path, 'r', encoding='utf-8') as file:
-            lines = [line.strip().split('\t') for line in file if line.strip()]
-            # Only keep lines with at least 2 columns
-            valid_lines = [line for line in lines if len(line) >= 2]
-            prompts = [line[0] for line in valid_lines]
-            seeds = [int(line[1]) for line in valid_lines]
-            image_indices = [f"{i:03d}" for i in range(len(prompts))]
+            # Check if it's a single prompt file
+            content = file.read().strip()
+            
+            # If no tabs, treat as single prompt
+            if '\t' not in content:
+                prompts = [content]
+                seeds = [torch.randint(0, 1000000, (1,)).item()]
+                image_indices = [os.path.splitext(os.path.basename(benchmark_path))[0]]
+            else:
+                # Tab-separated format
+                lines = content.split('\n')
+                lines = [line.strip().split('\t') for line in lines if line.strip()]
+                # Only keep lines with at least 2 columns
+                valid_lines = [line for line in lines if len(line) >= 2]
+                prompts = [line[0] for line in valid_lines]
+                seeds = [int(line[1]) for line in valid_lines]
+                image_indices = [f"{i:03d}" for i in range(len(prompts))]
+        
         return prompts, seeds, image_indices
 
 def main():
     parser = argparse.ArgumentParser(description="Direct Qwen-Image Inference")
     parser.add_argument('--benchmark_path', default='eval_benchmark/cool_sample.txt', 
-                       type=str, help='Path to benchmark file')
+                       type=str, help='Path to benchmark file or directory (e.g., eval_benchmark/dpg_bench/prompts)')
     parser.add_argument('--output_dir', default='results/qwen_direct', 
                        type=str, help='Output directory for generated images')
     parser.add_argument('--use_quantization', action='store_true', default=True,

@@ -4241,23 +4241,24 @@ def track_llm_call(llm_func, llm_type, *args, **kwargs):
     logger.info(f"LLM call {llm_type}: {latency:.2f}s, tokens: {prompt_tokens}+{completion_tokens}={total_tokens}")
     return response
 
-def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False, use_quantization=True, min_entries_for_guidance=None, gpu_id=0, total_gpus=1):
+def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, open_llm_model="mistralai/Mistral-Small-3.1-24B-Instruct-2503", open_llm_host="0.0.0.0", open_llm_port="8000", calculate_latency=False, use_quantization=True, min_entries_for_guidance=None, gpu_id=0, start_idx=0, end_idx=None):
     """Main CLI entry point."""
     # Check CUDA availability and initialize
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. This code requires a GPU to run.")
     
-    # Initialize primary CUDA device - always use 0 since CUDA_VISIBLE_DEVICES limits visibility
+    # Initialize CUDA device
     torch.cuda.init()
-    torch.cuda.set_device(0)
+    torch.cuda.set_device(gpu_id)
     
     # Print GPU info
-    gpu_name = torch.cuda.get_device_name(0)
-    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    gpu_name = torch.cuda.get_device_name(gpu_id)
+    gpu_memory = torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3
     print(f"\nUsing GPU {gpu_id}: {gpu_name}")
     print(f"Available GPU memory: {gpu_memory:.2f} GB")
     print(f"Number of available GPUs: {torch.cuda.device_count()}")
-    print(f"Multi-GPU setup: GPU {gpu_id}/{total_gpus-1}")
+    if start_idx > 0 or end_idx is not None:
+        print(f"Processing subset: indices {start_idx} to {end_idx if end_idx else 'end'}")
     # Declare globals
     global logger, config
     global llm_latencies, llm_token_counts
@@ -4290,84 +4291,115 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
     benchmark_list.append(os.path.join("eval_benchmark/", benchmark_name))
 
     for benchmark_dir in benchmark_list:
-
-        # Read prompts from the file
-        with open(benchmark_dir, 'r') as file:
-            if "DrawBench" in str(benchmark_name):
-                if "seed" in str(benchmark_name):
-                    lines = [line.strip().split('\t') for line in file]
-                    prompts = [line[0] for line in lines]
-                    seeds = [int(line[1]) for line in lines]
-                    bench_result_folder = 'DrawBench-fixseed'
+        
+        # Check if it's a directory (like dpg_bench/prompts)
+        if os.path.isdir(benchmark_dir):
+            # Get all .txt files sorted numerically
+            txt_files = sorted([f for f in os.listdir(benchmark_dir) if f.endswith('.txt')],
+                              key=lambda x: int(os.path.splitext(x)[0]) if os.path.splitext(x)[0].isdigit() else 0)
+            
+            prompts = []
+            seeds = []
+            prompt_keys = []
+            
+            for txt_file in txt_files:
+                file_path = os.path.join(benchmark_dir, txt_file)
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    prompt = f.read().strip()
+                    if prompt:
+                        prompts.append(prompt)
+                        seeds.append(torch.randint(0, 1000000, (1,)).item())
+                        # Use filename without extension as key
+                        prompt_keys.append(os.path.splitext(txt_file)[0])
+            
+            bench_result_folder = os.path.basename(os.path.dirname(benchmark_dir)) if os.path.basename(benchmark_dir) == 'prompts' else os.path.basename(benchmark_dir)
+            
+        else:
+            # Read prompts from the file
+            with open(benchmark_dir, 'r', encoding='utf-8') as file:
+                if "DrawBench" in str(benchmark_name):
+                    if "seed" in str(benchmark_name):
+                        lines = [line.strip().split('\t') for line in file]
+                        prompts = [line[0] for line in lines]
+                        seeds = [int(line[1]) for line in lines]
+                        bench_result_folder = 'DrawBench-fixseed'
+                    else:
+                        prompts = [line.strip().split('\t')[0] for line in file]
+                        seeds = [torch.randint(0, 1000000, (1,)).item() for _ in prompts]
+                        bench_result_folder = 'DrawBench'
+                    prompt_keys = prompts
+                elif "GenAIBenchmark" in str(benchmark_name):
+                    prompts = json.load(file)
+                    prompt_keys = list(prompts.keys())
+                    seeds = []
+                    bench_result_folder = 'GenAIBenchmark-fixseed'
+                elif benchmark_name.endswith('.csv'):
+                    import csv
+                    csv_reader = csv.DictReader(file)
+                    prompts = {}
+                    for row in csv_reader:
+                        # Create unique key combining category and id to handle duplicate IDs across categories
+                        unique_key = f"{row['category']}_{row['id']}"
+                        prompts[unique_key] = {
+                            'category': row['category'],
+                            'id': row['id'],
+                            'prompt': row['prompt_en'],
+                            'type': row['type'],
+                            'prompt_length': row['prompt_length'],
+                            'class': row.get('class', ''),
+                            'unique_key': unique_key  # Store the unique key for reference
+                        }
+                    prompt_keys = list(prompts.keys())
+                    seeds = []
+                    bench_result_folder = 'OneIG-Bench'
                 else:
-                    prompts = [line.strip().split('\t')[0] for line in file]
-                    bench_result_folder = 'DrawBench'
-                prompt_keys = prompts
-            elif "GenAIBenchmark" in str(benchmark_name):
-                prompts = json.load(file)
-                prompt_keys = list(prompts.keys())
-                bench_result_folder = 'GenAIBenchmark-fixseed'
-            elif benchmark_name.endswith('.csv'):
-                import csv
-                csv_reader = csv.DictReader(file)
-                prompts = {}
-                for row in csv_reader:
-                    # Create unique key combining category and id to handle duplicate IDs across categories
-                    unique_key = f"{row['category']}_{row['id']}"
-                    prompts[unique_key] = {
-                        'category': row['category'],
-                        'id': row['id'],
-                        'prompt': row['prompt_en'],
-                        'type': row['type'],
-                        'prompt_length': row['prompt_length'],
-                        'class': row.get('class', ''),
-                        'unique_key': unique_key  # Store the unique key for reference
-                    }
-                prompt_keys = list(prompts.keys())
-                bench_result_folder = 'OneIG-Bench'
-            else:
-                prompts = json.load(file)
-                prompt_keys = list(prompts.keys())
-                bench_result_folder = "123"
-            # else:
-            #     lines = [line.strip().split('\t') for line in file]
-            #     prompts = [line[0] for line in lines]
-            #     seeds = [int(line[1]) for line in lines]
-            #     prompt_keys = prompts
-            #     bench_result_folder = os.path.basename(benchmark_dir)
+                    # Try to load as JSON first
+                    try:
+                        prompts = json.load(file)
+                        prompt_keys = list(prompts.keys())
+                        seeds = []
+                        bench_result_folder = "custom_benchmark"
+                    except json.JSONDecodeError:
+                        # Fall back to text format
+                        file.seek(0)
+                        content = file.read().strip()
+                        if '\t' not in content:
+                            # Single prompt file
+                            prompts = [content]
+                            seeds = [torch.randint(0, 1000000, (1,)).item()]
+                            prompt_keys = [os.path.splitext(os.path.basename(benchmark_dir))[0]]
+                        else:
+                            # Tab-separated format
+                            lines = content.split('\n')
+                            lines = [line.strip().split('\t') for line in lines if line.strip()]
+                            prompts = [line[0] for line in lines]
+                            seeds = [int(line[1]) for line in lines]
+                            prompt_keys = prompts
+                        bench_result_folder = os.path.basename(benchmark_dir)
 
-        # Data splitting for multi-GPU processing
-        total_items = len(prompt_keys)
-        if total_gpus > 1:
-            # Calculate data split for this GPU
-            items_per_gpu = total_items // total_gpus
-            remainder = total_items % total_gpus
-            
-            # Distribute remainder among first few GPUs
-            if gpu_id < remainder:
-                start_idx_gpu = gpu_id * (items_per_gpu + 1)
-                end_idx_gpu = start_idx_gpu + items_per_gpu + 1
-            else:
-                start_idx_gpu = gpu_id * items_per_gpu + remainder
-                end_idx_gpu = start_idx_gpu + items_per_gpu
-            
-            # Split the data for this GPU
-            prompt_keys = prompt_keys[start_idx_gpu:end_idx_gpu]
-            
-            print(f"\n=== Multi-GPU Data Split ===")
-            print(f"GPU {gpu_id}: Processing items {start_idx_gpu}-{end_idx_gpu-1} ({len(prompt_keys)} items)")
-            print(f"Total dataset size: {total_items}")
-            print(f"============================\n")
-            
-            # Also split seeds if they exist
-            if "DrawBench" in str(benchmark_name) and "seed" in str(benchmark_name):
-                seeds = seeds[start_idx_gpu:end_idx_gpu]
-            
-            # For GenAI benchmark, we need to handle the dictionary differently
-            if "GenAIBenchmark" in str(benchmark_name) or benchmark_name.endswith('.csv'):
-                # Filter the prompts dictionary to only include this GPU's keys
-                gpu_prompts = {key: prompts[key] for key in prompt_keys}
-                prompts = gpu_prompts
+        # Apply data splitting after loading benchmarks
+        if end_idx is None:
+            end_idx = len(prompt_keys)
+        
+        # Slice the data based on start_idx and end_idx
+        original_length = len(prompt_keys)
+        prompt_keys = prompt_keys[start_idx:end_idx]
+        
+        if start_idx > 0 or end_idx < original_length:
+            print(f"\n=== Data Subset ===")
+            print(f"Processing items {start_idx} to {end_idx-1} ({len(prompt_keys)} items)")
+            print(f"Total dataset size: {original_length}")
+            print(f"===================\n")
+        
+        # Also split prompts and seeds based on their type
+        if isinstance(prompts, list):
+            # For list-based prompts (DrawBench, directory, etc.)
+            prompts = prompts[start_idx:end_idx]
+            if seeds:
+                seeds = seeds[start_idx:end_idx]
+        elif isinstance(prompts, dict):
+            # For dictionary-based prompts (GenAI, CSV, etc.)
+            prompts = {key: prompts[key] for key in prompt_keys}
 
         # Create model type suffix for directory
         model_suffix = model_version
@@ -4391,7 +4423,7 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 base_save_dir = os.path.join("results", bench_result_folder, f"AgentSys_{model_suffix}")
         
         # Add GPU-specific subdirectory for multi-GPU runs
-        if total_gpus > 1:
+        if start_idx > 0 or end_idx < original_length:
             save_dir = os.path.join(base_save_dir, f"gpu_{gpu_id}")
         else:
             save_dir = base_save_dir
@@ -4528,7 +4560,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                     "inference_times": inference_times,
                     "max_gpu_memories": max_gpu_memories,
                     "gpu_id": gpu_id,
-                    "total_gpus": total_gpus,
+                    "start_idx": start_idx,
+                    "end_idx": end_idx,
                     "total_items_for_gpu": len(prompt_keys),
                     "completed_items": idx + start_idx + 1
                 }
@@ -4705,7 +4738,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
                 "inference_times": inference_times,
                 "max_gpu_memories": max_gpu_memories,
                 "gpu_id": gpu_id,
-                "total_gpus": total_gpus,
+                "start_idx": start_idx,
+                "end_idx": end_idx,
                 "total_items_for_gpu": len(prompt_keys),
                 "completed_items": idx + start_idx + 1 if 'idx' in locals() else len(prompt_keys)
             }
@@ -4755,7 +4789,8 @@ def main(benchmark_name, human_in_the_loop, model_version, use_open_llm=False, o
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="T2I-Copilot Agent System")
-    parser.add_argument('--benchmark_name', default='cool_sample.txt', type=str, help='Path to the benchmark directory: cool_sample.txt, GenAIBenchmark/genai_image_seed.json, ambiguous_seed.txt')
+    parser.add_argument('--benchmark_name', default='cool_sample.txt', type=str, 
+                       help='Path to the benchmark file or directory: cool_sample.txt, GenAIBenchmark/genai_image_seed.json, ambiguous_seed.txt, dpg_bench/prompts')
     parser.add_argument('--human_in_the_loop', action='store_true', help='Use human in the loop')
     parser.add_argument('--model_version', default='vRelease', type=str, help= 'Model version')
     parser.add_argument('--use_open_llm', action='store_true', help='Use open source LLM.')
@@ -4768,7 +4803,8 @@ if __name__ == "__main__":
     parser.add_argument('--min_qwen_image_entries', default=5, type=int, help='Minimum entries in qwen_image DB before guidance is used')
     parser.add_argument('--min_qwen_edit_entries', default=5, type=int, help='Minimum entries in qwen_image_edit DB before guidance is used')
     parser.add_argument('--gpu_id', default=0, type=int, help='GPU ID to use for this process (0-based)')
-    parser.add_argument('--total_gpus', default=1, type=int, help='Total number of GPUs being used for parallel processing')
+    parser.add_argument('--start_idx', default=0, type=int, help='Start index for processing prompts (inclusive)')
+    parser.add_argument('--end_idx', default=None, type=int, help='End index for processing prompts (exclusive). If not specified, processes till the end')
 
     args = parser.parse_args()
     
@@ -4785,4 +4821,4 @@ if __name__ == "__main__":
         main(args.benchmark_name, args.human_in_the_loop, args.model_version, 
              args.use_open_llm, args.open_llm_model, args.open_llm_host, 
              args.open_llm_port, args.calculate_latency, True, min_entries_for_guidance,
-             args.gpu_id, args.total_gpus)
+             args.gpu_id, args.start_idx, args.end_idx)

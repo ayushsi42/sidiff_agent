@@ -136,12 +136,31 @@ def generate_image(pipe, prompt, seed, image_index, save_dir):
         return None
 
 def load_benchmark(benchmark_path):
-    """Load benchmark prompts and seeds from file"""
+    """Load benchmark prompts and seeds from file or directory"""
     prompts = []
     seeds = []
     image_indices = []
     
-    with open(benchmark_path, 'r') as file:
+    # Check if it's a directory (like dpg_bench/prompts)
+    if os.path.isdir(benchmark_path):
+        # Get all .txt files sorted numerically
+        txt_files = sorted([f for f in os.listdir(benchmark_path) if f.endswith('.txt')],
+                          key=lambda x: int(os.path.splitext(x)[0]) if os.path.splitext(x)[0].isdigit() else 0)
+        
+        for txt_file in txt_files:
+            file_path = os.path.join(benchmark_path, txt_file)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                prompt = f.read().strip()
+                if prompt:
+                    prompts.append(prompt)
+                    seeds.append(torch.randint(0, 1000000, (1,)).item())
+                    # Use filename without extension as index
+                    image_indices.append(os.path.splitext(txt_file)[0])
+        
+        return prompts, seeds, image_indices
+    
+    # Otherwise, it's a single file
+    with open(benchmark_path, 'r', encoding='utf-8') as file:
         if "DrawBench" in benchmark_path:
             if "seed" in benchmark_path:
                 lines = [line.strip().split('\t') for line in file]
@@ -158,6 +177,15 @@ def load_benchmark(benchmark_path):
                 prompts.append(data[key]['prompt'])
                 seeds.append(data[key].get('random_seed', torch.randint(0, 1000000, (1,)).item()))
                 image_indices.append(data[key]['id'])
+        
+        elif benchmark_path.endswith('.txt'):
+            # Single prompt file (like dpg_bench individual prompts)
+            prompt = file.read().strip()
+            if prompt:
+                prompts = [prompt]
+                seeds = [torch.randint(0, 1000000, (1,)).item()]
+                # Use filename without extension as index
+                image_indices = [os.path.splitext(os.path.basename(benchmark_path))[0]]
                 
         else:
             # Default format: prompt\tseed
@@ -171,13 +199,17 @@ def load_benchmark(benchmark_path):
 def main():
     parser = argparse.ArgumentParser(description="Direct Qwen-Image Inference")
     parser.add_argument('--benchmark_path', default='eval_benchmark/cool_sample.txt', 
-                       type=str, help='Path to benchmark file')
+                       type=str, help='Path to benchmark file or directory (e.g., eval_benchmark/dpg_bench/prompts)')
     parser.add_argument('--output_dir', default='results/qwen_direct', 
                        type=str, help='Output directory for generated images')
     parser.add_argument('--use_quantization', action='store_true', default=True,
                        help='Use quantization for memory efficiency')
     parser.add_argument('--start_idx', type=int, default=0,
-                       help='Start index for resuming generation')
+                       help='Start index for data splitting (inclusive)')
+    parser.add_argument('--end_idx', type=int, default=None,
+                       help='End index for data splitting (exclusive)')
+    parser.add_argument('--gpu_id', type=int, default=0,
+                       help='GPU ID to use for this process')
     
     args = parser.parse_args()
     
@@ -187,12 +219,12 @@ def main():
     
     # Initialize CUDA
     torch.cuda.init()
-    torch.cuda.set_device(0)
+    torch.cuda.set_device(args.gpu_id)
     
     # Print GPU info
-    gpu_name = torch.cuda.get_device_name(0)
-    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    print(f"\nUsing GPU: {gpu_name}")
+    gpu_name = torch.cuda.get_device_name(args.gpu_id)
+    gpu_memory = torch.cuda.get_device_properties(args.gpu_id).total_memory / 1024**3
+    print(f"\nUsing GPU {args.gpu_id}: {gpu_name}")
     print(f"Available GPU memory: {gpu_memory:.2f} GB")
     
     # Create output directory
@@ -202,6 +234,21 @@ def main():
     print(f"Loading benchmark from: {args.benchmark_path}")
     prompts, seeds, image_indices = load_benchmark(args.benchmark_path)
     print(f"Loaded {len(prompts)} prompts")
+    
+    # Apply data splitting for multi-GPU processing
+    total_prompts = len(prompts)
+    if args.end_idx is not None:
+        prompts = prompts[args.start_idx:args.end_idx]
+        seeds = seeds[args.start_idx:args.end_idx]
+        image_indices = image_indices[args.start_idx:args.end_idx]
+        print(f"GPU {args.gpu_id}: Processing slice [{args.start_idx}:{args.end_idx}] = {len(prompts)} prompts")
+    elif args.start_idx > 0:
+        prompts = prompts[args.start_idx:]
+        seeds = seeds[args.start_idx:]
+        image_indices = image_indices[args.start_idx:]
+        print(f"GPU {args.gpu_id}: Processing from index {args.start_idx} = {len(prompts)} prompts")
+    else:
+        print(f"GPU {args.gpu_id}: Processing all {len(prompts)} prompts")
     
     # Load model
     print("Loading Qwen-Image model...")
@@ -213,11 +260,11 @@ def main():
     failed_generations = 0
     
     # Generate images
-    print(f"Starting generation from index {args.start_idx}...")
+    print(f"Starting generation on GPU {args.gpu_id}...")
     for i, (prompt, seed, img_idx) in enumerate(tqdm(
-        zip(prompts[args.start_idx:], seeds[args.start_idx:], image_indices[args.start_idx:]),
-        desc="Generating images",
-        total=len(prompts) - args.start_idx
+        zip(prompts, seeds, image_indices),
+        desc=f"GPU {args.gpu_id} generating images",
+        total=len(prompts)
     )):
         start_time = time.time()
         
@@ -237,13 +284,15 @@ def main():
         # Save progress periodically
         if (i + 1) % 10 == 0:
             progress = {
-                "completed": i + 1 + args.start_idx,
+                "gpu_id": args.gpu_id,
+                "completed": i + 1,
                 "total": len(prompts),
                 "successful": successful_generations,
                 "failed": failed_generations,
                 "avg_time": sum(inference_times) / len(inference_times)
             }
-            with open(os.path.join(args.output_dir, "progress.json"), "w") as f:
+            progress_file = os.path.join(args.output_dir, f"progress_gpu_{args.gpu_id}.json")
+            with open(progress_file, "w") as f:
                 json.dump(progress, f, indent=2)
     
     # Final statistics
@@ -251,9 +300,9 @@ def main():
     avg_time = total_time / len(inference_times) if inference_times else 0
     
     print("\n" + "="*50)
-    print("GENERATION COMPLETE")
+    print(f"GENERATION COMPLETE ON GPU {args.gpu_id}")
     print("="*50)
-    print(f"Total prompts: {len(prompts)}")
+    print(f"Total prompts processed: {len(prompts)}")
     print(f"Successful generations: {successful_generations}")
     print(f"Failed generations: {failed_generations}")
     print(f"Average time per image: {avg_time:.2f} seconds")
@@ -262,6 +311,9 @@ def main():
     
     # Save final statistics
     final_stats = {
+        "gpu_id": args.gpu_id,
+        "start_idx": args.start_idx,
+        "end_idx": args.end_idx,
         "total_prompts": len(prompts),
         "successful_generations": successful_generations,
         "failed_generations": failed_generations,
@@ -270,7 +322,8 @@ def main():
         "inference_times": inference_times
     }
     
-    with open(os.path.join(args.output_dir, "final_stats.json"), "w") as f:
+    stats_file = os.path.join(args.output_dir, f"final_stats_gpu_{args.gpu_id}.json")
+    with open(stats_file, "w") as f:
         json.dump(final_stats, f, indent=2)
 
 if __name__ == "__main__":
